@@ -11,6 +11,7 @@
 #include <FL/Fl_Menu_Button.H>
 #include <FL/Fl_Menu_Item.H>
 #include <FL/Fl_Browser.H>
+#include <FL/Fl_Scroll.H>
 #include <FL/Fl_Input.H>
 #include <FL/Fl_Tabs.H>
 #include <FL/Fl_Progress.H>
@@ -128,9 +129,11 @@ struct Session {
     Fl_Group* view_explorer = nullptr;
     Fl_Group* view_run = nullptr;
     Fl_Group* view_settings = nullptr;
-    Fl_Browser* browser = nullptr;
+    Fl_Scroll* tree_scroll = nullptr;
+    Fl_Group* tree_inner = nullptr;
     Fl_Button* btn_badge = nullptr;
-    Fl_Browser* diag_list = nullptr;
+    Fl_Scroll* diag_scroll = nullptr;
+    Fl_Group* diag_inner = nullptr;
     Fl_Group* tabstrip = nullptr;
     Fl_Button* btn_close_tab = nullptr;
     Fl_Box* breadcrumb = nullptr;
@@ -139,7 +142,8 @@ struct Session {
     Fl_Group* empty_state = nullptr;
     Fl_Button* btn_empty_add = nullptr;
     Fl_Tabs* bottom_tabs = nullptr;
-    Fl_Browser* prob_list = nullptr;
+    Fl_Scroll* prob_scroll = nullptr;
+    Fl_Group* prob_inner = nullptr;
     Fl_Text_Display* out_disp = nullptr;
     Fl_Text_Buffer* out_buf = nullptr;
     Fl_Group* proc_row = nullptr;
@@ -153,7 +157,8 @@ struct Session {
 
     Fl_Double_Window* pal_win = nullptr;
     Fl_Input* pal_input = nullptr;
-    Fl_Browser* pal_list = nullptr;
+    Fl_Scroll* pal_scroll = nullptr;
+    Fl_Group* pal_inner = nullptr;
 
     int last_line = -1, last_col = -1;
     bool restyle_pending = false;
@@ -172,6 +177,9 @@ static constexpr int TITLE_H = 32, STATUS_H = 24, BOTTOM_H = 200;
 static constexpr int ERRBLOCK_H = 176;
 
 static void out_append(const std::string& text);
+static void diag_click_common(int line);
+static void tree_menu(int idx);
+static int vh_tree();
 
 // forward decls used across sections
 static void select_tab(const std::string& path);
@@ -381,23 +389,90 @@ static void buf_modify_cb(int pos, int ins, int del, int restyled,
 static void fill_errors() {
     g.err_count = g.warn_count = 0;
     g.err_refs.clear();
-    g.diag_list->clear();
-    g.prob_list->clear();
+    if (g.diag_inner) {
+        Fl_Group::current(g.diag_inner);
+        g.diag_inner->clear();
+    }
+    if (g.prob_inner) {
+        Fl_Group::current(g.prob_inner);
+        g.prob_inner->clear();
+    }
+    int y1 = g.diag_inner ? g.diag_inner->y() : 0;
+    int y2 = g.prob_inner ? g.prob_inner->y() : 0;
     for (const auto& e : g.diags) {
         (e.is_error ? g.err_count : g.warn_count)++;
         const std::string icon = e.is_error ? "✖" : "⚠";
         std::string line = icon + "  ";
         if (e.line > 0) line += std::to_string(e.line) + ": ";
         line += e.msg;
-        g.diag_list->add(line.c_str());
-        g.prob_list->add((line + (e.col > 0 ? "  [" + std::to_string(e.line) + ", " +
-                                    std::to_string(e.col) + "]" : "")).c_str());
         fs::path fp(e.file);
         if (fp.empty()) fp = g.cur_file;
         else if (fp.is_relative()) fp = fs::path(g.cur_file).parent_path() / fp;
+        const int idx = static_cast<int>(g.err_refs.size());
         g.err_refs.push_back({fp.string(), e.line, e.col > 0 ? e.col : 1});
+        if (g.diag_inner) {
+            auto* b = new Fl_Button(SB_X + 4, y1, SB_W - 20, 20);
+            b->copy_label(line.c_str());
+            b->box(FL_FLAT_BOX);
+            b->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+            b->labelsize(11);
+            b->color(theme::side());
+            b->labelcolor(e.is_error ? theme::red() : 0xd8a657ff);
+            b->callback([](Fl_Widget*, void* d) { diag_click_common((int)(intptr_t)d); },
+                        (void*)(intptr_t)idx);
+            y1 += 20;
+        }
+        if (g.prob_inner) {
+            const std::string full = line + (e.col > 0 ? "  [" + std::to_string(e.line) + ", " +
+                                             std::to_string(e.col) + "]" : "");
+            auto* b = new Fl_Button(MAIN_X + 8, y2, W - MAIN_X - 30, 20);
+            b->copy_label(full.c_str());
+            b->box(FL_FLAT_BOX);
+            b->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+            b->labelsize(12);
+            b->color(theme::side());
+            b->labelcolor(e.is_error ? theme::red() : 0xd8a657ff);
+            b->callback([](Fl_Widget*, void* d) { diag_click_common((int)(intptr_t)d); },
+                        (void*)(intptr_t)idx);
+            y2 += 20;
+        }
     }
+    if (g.diag_inner) { g.diag_inner->size(SB_W - 20, std::max(ERRBLOCK_H - 34, y1 - g.diag_inner->y() + 2)); g.diag_inner->redraw(); }
+    if (g.prob_inner) { g.prob_inner->size(W - MAIN_X - 26, std::max(40, y2 - g.prob_inner->y() + 2)); g.prob_inner->redraw(); }
+    if (g.diag_scroll) g.diag_scroll->redraw();
+    if (g.prob_scroll) g.prob_scroll->redraw();
     update_badges();
+}
+
+static int vh_tree() {
+    return H - TITLE_H - STATUS_H - ERRBLOCK_H - 52;
+}
+
+static void tree_menu(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(g.rows.size())) return;
+    const Session::Row row = g.rows[idx];
+    if (row.file >= 0) {
+        const Project& p = g.store.projects[row.proj];
+        if (row.file >= static_cast<int>(p.files.size())) return;
+        const fs::path f = p.files[row.file];
+        if (fl_choice("Убрать «%s» из проекта?\n(файл на диске не удаляется)",
+                      "Отмена", "Убрать", nullptr,
+                      f.filename().string().c_str()) != 1) return;
+        g.store.remove_file(row.proj, f);
+        close_file(f.string());
+        g.store.save();
+        rebuild_browser();
+        return;
+    }
+    const Project& p = g.store.projects[row.proj];
+    if (fl_choice("Удалить проект «%s» из списка?\n(файлы на диске останутся)",
+                  "Отмена", "Удалить", nullptr, p.name.c_str()) != 1) return;
+    for (const auto& f : p.files) close_file(f.string());
+    g.store.remove_project(row.proj);
+    g.cur_proj = -1;
+    g.store.save();
+    rebuild_browser();
+    update_title();
 }
 
 static void diag_click_common(int line) {
@@ -466,7 +541,8 @@ void open_file(const std::string& path) {
     g.dirty[path] = false;
     buf->add_modify_callback(buf_modify_cb, nullptr);
 
-    auto btn = new Fl_Button(0, 0, 150, 22, fs::path(path).filename().string().c_str());
+    auto btn = new Fl_Button(0, 0, 150, 22);
+    btn->copy_label(fs::path(path).filename().string().c_str());
     btn->box(FL_FLAT_BOX);
     btn->tooltip("ЛКМ — открыть · ПКМ — закрыть");
     btn->callback([](Fl_Widget* w, void* data) {
@@ -544,37 +620,15 @@ static void close_file(const std::string& path) {
 
 // ---------------------------------------------------------------- browser
 
-static void rebuild_browser() {
-    g.browser->clear();
-    g.rows.clear();
-    for (int i = 0; i < static_cast<int>(g.store.projects.size()); ++i) {
-        const Project& p = g.store.projects[i];
-        g.browser->add((std::to_string(i + 1) + ".  " + p.name).c_str());
-        g.rows.push_back({i, -1});
-        if (i == g.cur_proj) {
-            for (const auto& f : p.files) {
-                const bool is_last = (f == p.last_open);
-                g.browser->add(("      " + f.filename().string() +
-                                (is_last ? "   ●" : "")).c_str());
-                g.rows.push_back({i, static_cast<int>(&f - p.files.data())});
-            }
-        }
-    }
-    int sel_line = 0;
-    for (size_t r = 0; r < g.rows.size(); ++r)
-        if (g.rows[r].proj == g.cur_proj && g.rows[r].file == -1) { sel_line = int(r) + 1; break; }
-    if (sel_line) g.browser->value(sel_line);
-}
-
-static void browser_menu(int line);
-
-static void browser_cb(Fl_Widget*, void*) {
-    const int line = g.browser->value();
-    if (Fl::event_button() == FL_RIGHT_MOUSE) { browser_menu(line); return; }
-    if (line <= 0 || line > static_cast<int>(g.rows.size())) return;
-    const Session::Row& row = g.rows[line - 1];
+// button-row callback: index into g.rows via user_data
+static void tree_row_cb(Fl_Widget* w, void* data) {
+    const int idx = static_cast<int>((intptr_t)data);
+    if (idx < 0 || idx >= static_cast<int>(g.rows.size())) return;
+    const Session::Row row = g.rows[idx];
+    if (Fl::event_button() == FL_RIGHT_MOUSE) { tree_menu(idx); return; }
     if (row.file >= 0) {
         const Project& p = g.store.projects[row.proj];
+        if (row.file >= static_cast<int>(p.files.size())) return;
         const fs::path f = p.files[row.file];
         g.cur_proj = row.proj;
         if (f.string() != g.cur_file) open_file(f.string());
@@ -598,9 +652,62 @@ static void browser_cb(Fl_Widget*, void*) {
     update_breadcrumb();
 }
 
+static void rebuild_browser() {
+    if (!g.tree_inner) return;
+    g.rows.clear();
+    // pre-compute the content height, size the inner group BEFORE adding rows:
+    // a resize with children inside would shift them (FLTK group semantics)
+    int rows_n = 0;
+    for (const auto& prj : g.store.projects)
+        rows_n += 1 + (prj.name.empty() ? 0 : (g.store.projects[g.cur_proj].name == prj.name
+                                               ? static_cast<int>(prj.files.size()) : 0));
+    const int content_h = std::max(vh_tree(), rows_n * 22 + 6);
+    g.tree_inner->size(SB_W - 22, content_h);
+    g.tree_inner->clear();
+    Fl_Group::current(g.tree_inner);
+    int y = g.tree_inner->y();
+    for (int i = 0; i < static_cast<int>(g.store.projects.size()); ++i) {
+        const Project& p = g.store.projects[i];
+        const int idx = static_cast<int>(g.rows.size());
+        g.rows.push_back({i, -1});
+        auto* b = new Fl_Button(SB_X + 2, y, SB_W - 26, 22);
+        b->copy_label((std::to_string(i + 1) + ".  " + p.name).c_str());
+        b->box(FL_FLAT_BOX);
+        b->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        b->labelfont(FL_BOLD);
+        b->labelsize(12);
+        b->color(i == g.cur_proj ? theme::sel() : theme::side());
+        b->labelcolor(i == g.cur_proj ? FL_WHITE : theme::fg());
+        b->callback(tree_row_cb, (void*)(intptr_t)idx);
+        y += 22;
+        if (i == g.cur_proj) {
+            for (const auto& f : p.files) {
+                const int fidx = static_cast<int>(g.rows.size());
+                g.rows.push_back({i, static_cast<int>(&f - p.files.data())});
+                const bool is_last = (f == p.last_open);
+                const bool active = (f.string() == g.cur_file);
+                auto* fb = new Fl_Button(SB_X + 18, y, SB_W - 42, 20);
+                fb->copy_label(("   " + f.filename().string() + (is_last ? "   ●" : "")).c_str());
+                fb->box(FL_FLAT_BOX);
+                fb->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+                fb->labelsize(11);
+                fb->color(active ? theme::sel() : theme::side());
+                fb->labelcolor(active ? FL_WHITE : theme::fg());
+                fb->callback(tree_row_cb, (void*)(intptr_t)fidx);
+                y += 20;
+            }
+        }
+    }
+    Fl_Group::current(0);
+    g.tree_inner->redraw();
+    g.tree_scroll->redraw();
+}
+
+static void browser_menu(int line);
+
 static void browser_menu(int line) {
     if (line <= 0 || line > static_cast<int>(g.rows.size())) return;
-    const Session::Row& row = g.rows[line - 1];
+    const Session::Row row = g.rows[line - 1];
     Fl_Menu_Item items[] = {
         {"Новый файл",        0, nullptr, (void*)1, FL_MENU_VALUE, 0, 0, 0, 0},
         {"Добавить файлы…",   0, nullptr, (void*)2, 0,             0, 0, 0, 0},
@@ -1060,8 +1167,11 @@ static void save_cb(Fl_Widget*, void*) { do_save(false); }
 static void palette_fill_enter(const std::string& row_text);
 
 static void palette_fill(const std::string& filter) {
-    g.pal_list->clear();
+    if (!g.pal_inner) return;
+    Fl_Group::current(g.pal_inner);
+    g.pal_inner->clear();
     const std::string f = util::to_lower(filter);
+    int y = g.pal_inner->y();
     for (int i = 0; i < static_cast<int>(g.store.projects.size()); ++i) {
         const Project& p = g.store.projects[i];
         for (const auto& file : p.files) {
@@ -1069,9 +1179,33 @@ static void palette_fill(const std::string& filter) {
             if (!f.empty() &&
                 util::to_lower(name).find(f) == std::string::npos &&
                 util::to_lower(p.name).find(f) == std::string::npos) continue;
-            g.pal_list->add(("  " + name + "    — " + p.name).c_str());
+            const std::string pname = p.name;
+            const int pi = i;
+            const int fi = static_cast<int>(&file - p.files.data());
+            auto* b = new Fl_Button(10, y, 500, 24);
+            b->copy_label(("  " + name + "    — " + pname).c_str());
+            b->box(FL_FLAT_BOX);
+            b->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+            b->labelsize(13);
+            b->color(theme::side());
+            b->callback([](Fl_Widget*, void* d) {
+                const int prj = (int)((intptr_t)d >> 16);
+                const int flr = (int)((intptr_t)d & 0xFFFF);
+                if (prj < 0 || prj >= static_cast<int>(g.store.projects.size())) return;
+                if (flr < 0 || flr >= static_cast<int>(g.store.projects[prj].files.size())) return;
+                g.cur_proj = prj;
+                g.store.save();
+                rebuild_browser();
+                open_file(g.store.projects[prj].files[flr].string());
+                if (g.pal_win) g.pal_win->hide();
+            }, (void*)(intptr_t)((pi << 16) | fi));
+            y += 24;
         }
     }
+    Fl_Group::current(0);
+    g.pal_inner->size(520, std::max(360, y - g.pal_inner->y() + 4));
+    g.pal_inner->redraw();
+    if (g.pal_scroll) g.pal_scroll->redraw();
 }
 
 static void palette_open() {
@@ -1082,25 +1216,21 @@ static void palette_open() {
         auto* in = new Fl_Input(10, 10, 500, 28);
         in->callback([](Fl_Widget* w, void*) {
             if (Fl::event_key() == FL_Enter) {
-                g.pal_list->value(g.pal_list->value() ? g.pal_list->value() : 1);
-                const char* t = g.pal_list->text(g.pal_list->value());
-                if (t) palette_fill_enter(std::string(t));
+                if (g.pal_inner->children() > 0) g.pal_inner->child(0)->do_callback();
                 return;
             }
             palette_fill(static_cast<Fl_Input*>(w)->value());
         });
         in->when(FL_WHEN_CHANGED | FL_WHEN_ENTER_KEY | FL_WHEN_NOT_CHANGED);
-        auto* list = new Fl_Browser(10, 46, 500, 364);
-        list->type(FL_HOLD_BROWSER);
-        list->textfont(FL_COURIER);
-        list->callback([](Fl_Widget* w, void*) {
-            auto* br = static_cast<Fl_Browser*>(w);
-            const char* t = br->text(br->value());
-            if (t) palette_fill_enter(std::string(t));
-        });
+        auto* scroll = new Fl_Scroll(10, 46, 500, 364);
+        auto* inner = new Fl_Group(10, 46, 480, 364);
+        inner->end();
+        scroll->end();
+        g.pal_scroll = scroll;
+        g.pal_inner = inner;
         g.pal_input = in;
-        g.pal_list = list;
         g.pal_win->end();
+        palette_fill("");
     }
     g.pal_input->value("");
     palette_fill("");
@@ -1319,14 +1449,6 @@ static void start_cb_impl(bool debug_mode) {
 static void start_cb3(Fl_Widget*, void*, bool debug_mode) { start_cb_impl(debug_mode); }
 
 // ---------------------------------------------------------------- errors click
-
-static void diag_list_cb(Fl_Widget* w, void*) {
-    diag_click_common(static_cast<Fl_Browser*>(w)->value());
-}
-
-static void prob_list_cb(Fl_Widget* w, void*) {
-    diag_click_common(static_cast<Fl_Browser*>(w)->value());
-}
 
 static void badge_cb(Fl_Widget*, void*) {
     show_view(0);
@@ -1571,12 +1693,13 @@ int main(int argc, char** argv) {
                 }
                 register_project_files(dir.filename().string(), files);
             });
-            auto* br = new Fl_Browser(SB_X, TITLE_H + 52, SB_W, vh - 52);
-            br->when(FL_WHEN_RELEASE);  // every click acts, even on the selected row
-            br->callback(browser_cb);
-            br->textsize(12);
-            br->tooltip("Проекты. Клик — раскрыть и открыть последний файл. ПКМ — действия.");
-            g.browser = br;
+            auto* tscroll = new Fl_Scroll(SB_X, TITLE_H + 52, SB_W, vh - 52);
+            tscroll->type(Fl_Scroll::HORIZONTAL_ALWAYS);
+            auto* tinner = new Fl_Group(SB_X, TITLE_H + 52, SB_W - 22, vh - 52);
+            tinner->end();
+            tscroll->end();
+            g.tree_scroll = tscroll;
+            g.tree_inner = tinner;
             v->end();
 
             auto* eb = new Fl_Group(SB_X, TITLE_H + vh, SB_W, ERRBLOCK_H);
@@ -1588,12 +1711,12 @@ int main(int argc, char** argv) {
             badge->callback(badge_cb);
             badge->tooltip("Показать проблемы");
             g.btn_badge = badge;
-            auto* dl = new Fl_Browser(SB_X, TITLE_H + vh + 30, SB_W, ERRBLOCK_H - 30);
-            dl->textsize(11);
-            dl->callback(diag_list_cb);
-            dl->when(FL_WHEN_CHANGED);
-            dl->tooltip("Ошибки и предупреждения. Клик — перейти к строке.");
-            g.diag_list = dl;
+            auto* dscroll = new Fl_Scroll(SB_X, TITLE_H + vh + 30, SB_W, ERRBLOCK_H - 30);
+            auto* dinner = new Fl_Group(SB_X, TITLE_H + vh + 30, SB_W - 20, ERRBLOCK_H - 30);
+            dinner->end();
+            dscroll->end();
+            g.diag_scroll = dscroll;
+            g.diag_inner = dinner;
             eb->end();
         }
 
@@ -1734,11 +1857,12 @@ int main(int argc, char** argv) {
                 g.bottom_tabs = bt;
                 const int inner_h = BOTTOM_H - 26 - 27;
                 auto* pg = new Fl_Group(MAIN_X, tabs_y + 25, W - MAIN_X, inner_h, "Проблемы");
-                auto* pl = new Fl_Browser(MAIN_X + 8, tabs_y + 31, W - MAIN_X - 16, inner_h - 8);
-                pl->textsize(12);
-                pl->callback(prob_list_cb);
-                pl->when(FL_WHEN_CHANGED);
-                g.prob_list = pl;
+                auto* pscroll = new Fl_Scroll(MAIN_X + 4, tabs_y + 28, W - MAIN_X - 12, inner_h - 4);
+                auto* pinner = new Fl_Group(MAIN_X + 4, tabs_y + 28, W - MAIN_X - 26, inner_h - 4);
+                pinner->end();
+                pscroll->end();
+                g.prob_scroll = pscroll;
+                g.prob_inner = pinner;
                 pg->end();
                 auto* og = new Fl_Group(MAIN_X, tabs_y + 25, W - MAIN_X, inner_h, "Вывод");
                 auto* ob = new Fl_Text_Buffer();
