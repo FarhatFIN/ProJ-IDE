@@ -16,7 +16,6 @@
 #include <FL/Fl_Progress.H>
 #include <FL/Fl_Text_Editor.H>
 #include <FL/Fl_Text_Display.H>
-#include <FL/Fl_Native_File_Chooser.H>
 #include <FL/fl_ask.H>
 
 #include "util.hpp"
@@ -665,6 +664,179 @@ static void browser_menu(int line) {
     }
 }
 
+// ---------------------------------------------------------------- file dialog
+
+// Native chooser replacement: fully FLTK directory browser, no GTK modules.
+// Mode FILES — multi-select of files; mode DIR — pick a directory.
+namespace filedlg {
+
+struct State {
+    Fl_Double_Window* win = nullptr;
+    Fl_Input* path = nullptr;
+    Fl_Browser* list = nullptr;
+    std::vector<fs::path> result;
+    fs::path cur;
+    bool dir_mode = false;
+} st;
+
+void populate() {
+    st.list->clear();
+    if (st.cur.has_parent_path() && st.cur != st.cur.root_path())
+        st.list->add("../");
+    std::vector<fs::path> dirs, files;
+    std::error_code ec;
+    for (fs::directory_iterator it(st.cur, fs::directory_options::skip_permission_denied, ec), e;
+         it != e; it.increment(ec)) {
+        const fs::path p = it->path();
+        if (it->is_directory(ec)) dirs.push_back(p);
+        else {
+            if (st.dir_mode) continue;
+            std::ifstream f(p, std::ios::binary);
+            char b[512] = {0};
+            f.read(b, sizeof(b));
+            if (f.gcount() > 0 && std::memchr(b, 0, static_cast<size_t>(f.gcount()))) continue;
+            files.push_back(p);
+        }
+    }
+    std::sort(dirs.begin(), dirs.end());
+    std::sort(files.begin(), files.end());
+    for (auto& d : dirs) st.list->add(("./" + d.filename().string() + "/").c_str());
+    for (auto& f : files) st.list->add(f.filename().string().c_str());
+    st.path->value(st.cur.string().c_str());
+}
+
+void confirm_dir() {
+    st.result = {st.cur};
+    st.win->hide();
+}
+
+void row_action(const char* text) {
+    std::string t = text ? text : "";
+    if (t == "../") {
+        if (st.cur.has_parent_path()) st.cur = st.cur.parent_path();
+        populate();
+        return;
+    }
+    if (!t.empty() && t.back() == '/') {
+        fs::path next = st.cur / t.substr(2, t.size() - 3);
+        std::error_code ec;
+        if (fs::is_directory(next, ec)) { st.cur = next; populate(); }
+        return;
+    }
+    if (st.dir_mode) return;
+    st.result = {st.cur / t};
+    st.win->hide();
+}
+
+std::vector<fs::path> pick_files(Fl_Window* parent, const std::string& start) {
+    st.result.clear();
+    st.dir_mode = false;
+    st.cur = start.empty() ? util::home_dir() : fs::path(start);
+    if (!fs::exists(st.cur)) st.cur = util::home_dir();
+
+    st.win = new Fl_Double_Window(600, 440, "Открыть файлы");
+    st.win->set_modal();
+    auto* pi = new Fl_Input(10, 10, 480, 24, "Путь:");
+    pi->textfont(FL_COURIER); pi->textsize(11);
+    st.path = pi;
+    auto* home = new Fl_Button(498, 10, 44, 24, "Дом");
+    auto* up = new Fl_Button(546, 10, 44, 24, "Вверх");
+    auto* list = new Fl_Browser(10, 42, 580, 340);
+    list->type(FL_MULTI_BROWSER);
+    list->textfont(FL_COURIER); list->textsize(12);
+    st.list = list;
+    auto* ok = new Fl_Button(462, 396, 128, 28, "Выбрать");
+    st.win->end();
+
+    pi->callback([](Fl_Widget* w, void*) {
+        if (Fl::event_key() != FL_Enter) return;
+        fs::path p(util::trim(static_cast<Fl_Input*>(w)->value()));
+        std::error_code ec;
+        if (fs::is_directory(p, ec)) { st.cur = p; populate(); return; }
+        if (fs::is_regular_file(p, ec) && !st.dir_mode) {
+            st.result = {p};
+            st.win->hide();
+        }
+    });
+    pi->when(FL_WHEN_ENTER_KEY);
+    home->callback([](Fl_Widget*, void*) { st.cur = util::home_dir(); populate(); });
+    up->callback([](Fl_Widget*, void*) {
+        if (st.cur.has_parent_path()) { st.cur = st.cur.parent_path(); populate(); }
+    });
+    list->callback([](Fl_Widget* w, void*) {
+        auto* br = static_cast<Fl_Browser*>(w);
+        if (Fl::event_clicks() > 0 || Fl::event_key() == FL_Enter)
+            row_action(br->text(br->value()));
+    });
+    ok->callback([](Fl_Widget*, void*) {
+        st.result.clear();
+        for (int i = 1; i <= st.list->size(); ++i)
+            if (st.list->selected(i)) {
+                std::string t = st.list->text(i);
+                if (t != "../" && (t.empty() || t.back() != '/'))
+                    st.result.push_back(st.cur / t);
+            }
+        st.win->hide();
+    });
+
+    populate();
+    st.win->show();
+    while (st.win->visible_r()) Fl::wait();
+    delete st.win;
+    st.win = nullptr;
+    return st.result;
+}
+
+std::optional<fs::path> pick_dir(Fl_Window* parent, const std::string& start) {
+    st.result.clear();
+    st.dir_mode = true;
+    st.cur = start.empty() ? util::home_dir() : fs::path(start);
+    if (!fs::exists(st.cur)) st.cur = util::home_dir();
+
+    st.win = new Fl_Double_Window(600, 440, "Выбрать папку");
+    st.win->set_modal();
+    auto* pi = new Fl_Input(10, 10, 480, 24, "Путь:");
+    pi->textfont(FL_COURIER); pi->textsize(11);
+    st.path = pi;
+    auto* home = new Fl_Button(498, 10, 44, 24, "Дом");
+    auto* up = new Fl_Button(546, 10, 44, 24, "Вверх");
+    auto* list = new Fl_Browser(10, 42, 580, 340);
+    list->type(FL_HOLD_BROWSER);
+    list->textfont(FL_COURIER); list->textsize(12);
+    st.list = list;
+    auto* ok = new Fl_Button(462, 396, 128, 28, "Эта папка");
+    st.win->end();
+
+    pi->callback([](Fl_Widget* w, void*) {
+        if (Fl::event_key() != FL_Enter) return;
+        fs::path p(util::trim(static_cast<Fl_Input*>(w)->value()));
+        std::error_code ec;
+        if (fs::is_directory(p, ec)) { st.cur = p; populate(); return; }
+    });
+    pi->when(FL_WHEN_ENTER_KEY);
+    home->callback([](Fl_Widget*, void*) { st.cur = util::home_dir(); populate(); });
+    up->callback([](Fl_Widget*, void*) {
+        if (st.cur.has_parent_path()) { st.cur = st.cur.parent_path(); populate(); }
+    });
+    list->callback([](Fl_Widget* w, void*) {
+        auto* br = static_cast<Fl_Browser*>(w);
+        if (Fl::event_clicks() > 0 || Fl::event_key() == FL_Enter)
+            row_action(br->text(br->value()));
+    });
+    ok->callback([](Fl_Widget*, void*) { confirm_dir(); });
+
+    populate();
+    st.win->show();
+    while (st.win->visible_r()) Fl::wait();
+    delete st.win;
+    st.win = nullptr;
+    if (st.result.empty()) return std::nullopt;
+    return st.result.front();
+}
+
+} // namespace filedlg
+
+
 // ---------------------------------------------------------------- imports
 
 // text files of a directory tree; binaries and junk dirs skipped
@@ -827,14 +999,11 @@ static void import_git_dialog() {
 static void github_import_cb(Fl_Widget*, void*) { import_git_dialog(); }
 
 static void add_files_flow(int project_idx) {
-    Fl_Native_File_Chooser chooser;
-    chooser.title("Выберите файлы");
-    chooser.type(Fl_Native_File_Chooser::BROWSE_MULTI_FILE);
-    chooser.filter("*\tВсе файлы (*)");
-    if (chooser.show() != 0) return;
-    std::vector<fs::path> files;
-    for (int i = 0; i < chooser.count(); ++i)
-        files.push_back(fs::path(chooser.filename(i)));
+    std::string start;
+    if (g.cur_proj >= 0 && g.cur_proj < static_cast<int>(g.store.projects.size()) &&
+        !g.store.projects[g.cur_proj].files.empty())
+        start = g.store.projects[g.cur_proj].files.front().parent_path().string();
+    std::vector<fs::path> files = filedlg::pick_files(g.win, start);
     if (files.empty()) return;
     const bool have = project_idx >= 0 &&
                       project_idx < static_cast<int>(g.store.projects.size());
@@ -1390,11 +1559,9 @@ int main(int argc, char** argv) {
             di->labelsize(10);
             di->tooltip("Импорт целой папки (все текстовые файлы)");
             di->callback([](Fl_Widget*, void*) {
-                Fl_Native_File_Chooser ch;
-                ch.title("Выбери папку проекта");
-                ch.type(Fl_Native_File_Chooser::BROWSE_DIRECTORY);
-                if (ch.show() != 0) return;
-                fs::path dir(ch.filename());
+                auto dirv = filedlg::pick_dir(g.win, "");
+                if (!dirv) return;
+                fs::path dir = *dirv;
                 std::vector<fs::path> files;
                 collect_text_files(dir, files);
                 if (files.empty()) {
