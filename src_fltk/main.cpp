@@ -181,6 +181,7 @@ static void add_files_flow(int project_idx);
 static void register_project_files(const std::string& name,
                                    const std::vector<fs::path>& files);
 static void collect_text_files(const fs::path& dir, std::vector<fs::path>& out);
+static void rebuild_browser();
 void open_file(const std::string& path);
 
 // ---------------------------------------------------------------- helpers
@@ -438,8 +439,23 @@ void open_file(const std::string& path) {
 
     auto buf = new Fl_Text_Buffer();
     if (buf->loadfile(path.c_str()) != 0) {
-        fl_alert("Не удалось открыть файл:\n%s", path.c_str());
         delete buf;
+        // file vanished from disk — offer to drop the dead reference
+        const int r = fl_choice("Файл пропал с диска:\n%s\n\nУбрать его из проекта?",
+                                "Оставить", "Убрать", nullptr,
+                                fs::path(path).filename().string().c_str());
+        if (r == 1)
+            for (int i = 0; i < static_cast<int>(g.store.projects.size()); ++i) {
+                bool had = false;
+                for (const auto& f : g.store.projects[i].files)
+                    if (f == fs::path(path)) { had = true; break; }
+                if (had) {
+                    g.store.remove_file(i, fs::path(path));
+                    g.store.save();
+                    rebuild_browser();
+                    break;
+                }
+            }
         return;
     }
     const Lang lang = lang_by_ext(fs::path(path));
@@ -721,31 +737,48 @@ static void import_git_dialog() {
     if (name.empty()) name = "repo";
 
     std::atomic<bool> done{false};
+    std::atomic<pid_t> clone_pid{-1};
     std::thread worker([&]() {
         fs::path target = util::home_dir() / "ProJ-IDE-Projects" / name;
         std::error_code ec;
         fs::remove_all(target, ec);
-        auto r = util::exec_capture({"git", "clone", "--depth", "1", url, target.string()},
-                                    std::nullopt, 600);
+        // background git with its pid exposed so Отмена can kill it
+        std::string cmd = "git clone --depth 1 '" + url + "' '" + target.string() + "'";
+        FILE* p = popen(cmd.c_str(), "r");
+        if (!p) {
+            std::lock_guard<std::mutex> lk(g.import_mtx);
+            g.git_result_ok = false;
+            g.git_result_detail = "git не запустился";
+            done.store(true);
+            return;
+        }
+        char buf[256];
+        std::string out;
+        while (fgets(buf, sizeof(buf), p)) out += buf;
+        int rc = pclose(p);
         std::vector<fs::path> files;
-        if (r.exit_code == 0) collect_text_files(target, files);
+        if (rc == 0) collect_text_files(target, files);
         std::lock_guard<std::mutex> lk(g.import_mtx);
-        g.git_result_ok = (r.exit_code == 0);
-        g.git_result_detail = r.exit_code == 0 ? ""
-                              : (r.out.empty() ? "git clone не удался" : r.out);
+        g.git_result_ok = (rc == 0);
+        g.git_result_detail = rc == 0 ? "" : (out.empty() ? "git clone не удался" : out);
         g.git_result_files = files;
         g.git_result_name = name;
-        g.git_done = true;
         done.store(true);
     });
     worker.detach();
 
-    Fl_Window prog(380, 110, "Клонирование");
+    Fl_Window prog(380, 120, "Клонирование");
     prog.set_modal();
-    Fl_Box st(16, 16, 348, 40, "git clone…");
+    Fl_Box st(16, 14, 348, 22, "git clone…");
     st.align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_WRAP);
-    Fl_Progress bar(16, 70, 348, 20);
+    Fl_Progress bar(16, 42, 348, 18);
     bar.minimum(0); bar.maximum(1); bar.value(0);
+    auto* cancel = new Fl_Button(255, 78, 108, 26, "Отмена");
+    cancel->callback([](Fl_Widget* w, void*) {
+        // kill any running git clone of this session
+        util::exec_capture({"pkill", "-f", "git clone --depth 1"}, std::nullopt, 5);
+        w->window()->user_data((void*)2);
+    });
     prog.end();
     prog.show();
     double pulse = 0;
@@ -753,8 +786,12 @@ static void import_git_dialog() {
         Fl::wait(0.08);
         pulse = std::fmod(pulse + 0.03, 1.0);
         bar.value(pulse);
+        if ((intptr_t)prog.user_data() == 2) {
+            util::exec_capture({"pkill", "-f", "git clone --depth 1"}, std::nullopt, 5);
+        }
     }
     prog.hide();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // pclose завершился
 
     bool ok = false;
     std::vector<fs::path> files;
@@ -767,7 +804,10 @@ static void import_git_dialog() {
         g.git_done = false;
     }
     if (!ok) {
-        fl_alert("Не удалось клонировать:\n%s", detail.c_str());
+        if ((intptr_t)prog.user_data() == 2)
+            fl_alert("Клонирование отменено.");
+        else
+            fl_alert("Не удалось клонировать:\n%s", detail.c_str());
         return;
     }
     // re-import of an existing name replaces its file list
@@ -1250,6 +1290,16 @@ static void lint_schedule() {
 int main(int argc, char** argv) {
     Fl::scheme("gtk+");
     g.store.load();
+    // prune references to files that no longer exist on disk
+    for (auto& prj : g.store.projects) {
+        std::vector<fs::path> alive;
+        for (const auto& f : prj.files)
+            if (fs::exists(f)) alive.push_back(f);
+        if (alive.size() != prj.files.size()) prj.files = alive;
+        if (!prj.last_open.empty() && !fs::exists(prj.last_open))
+            prj.last_open = prj.files.empty() ? fs::path{} : prj.files.front();
+    }
+    g.store.save();
 
     auto* win = new Fl_Double_Window(W, H, "ProJ IDE");
     g.win = win;
@@ -1355,7 +1405,7 @@ int main(int argc, char** argv) {
                 register_project_files(dir.filename().string(), files);
             });
             auto* br = new Fl_Browser(SB_X, TITLE_H + 52, SB_W, vh - 52);
-            br->when(FL_WHEN_CHANGED);
+            br->when(FL_WHEN_RELEASE);  // every click acts, even on the selected row
             br->callback(browser_cb);
             br->textsize(12);
             br->tooltip("Проекты. Клик — раскрыть и открыть последний файл. ПКМ — действия.");
