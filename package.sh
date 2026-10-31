@@ -1,8 +1,8 @@
 #!/bin/bash
-# ProJ IDE — packages: .deb (Debian/Kali/Ubuntu), .rpm (Fedora), .zip (Windows)
+# ProJ IDE — packages: .deb (Debian/Kali/Ubuntu), .rpm (Fedora). Native window only.
 set -e
 cd "$(dirname "$0")"
-VERSION=1.0.0
+VERSION=1.1.0
 mkdir -p dist
 rm -rf dist/pkg dist/projide-$VERSION dist/staging
 mkdir -p dist/pkg/DEBIAN dist/pkg/usr/bin dist/pkg/usr/share/applications \
@@ -34,27 +34,27 @@ DESK
 cp dist/pkg/usr/share/applications/proj-ide.desktop dist/staging/usr/share/applications/
 
 # ---------- DEB ----------
-cp projide projide-app dist/pkg/usr/bin/
+cp projide-app dist/pkg/usr/bin/
 cat > dist/pkg/DEBIAN/control <<CTRL
 Package: projide
 Version: $VERSION
 Section: devel
 Priority: optional
 Architecture: amd64
-Depends: libwebkit2gtk-4.1-0, libgtk-3-0
+Depends: libfltk1.3-0, libfltk-images-1.3
 Recommends: build-essential, python3
 Maintainer: dj <dj@localhost>
 Description: ProJ IDE — compact IDE with a local build engine
- Minimal IDE: projects, Monaco-based editor served by an embedded C++
- HTTP engine, local g++/gcc/nasm/python builds with live program I/O,
- trusted compiler auto-install. Ships both a native GTK/WebKit window
- (projide-app) and a server mode that opens the system browser (projide).
+ Minimal IDE: projects, native editor with syntax highlighting, local
+ g++/gcc/nasm/python builds with live program I/O, gdb debugging,
+ real-time diagnostics, GitHub and directory import, trusted compiler
+ auto-install.
 CTRL
 dpkg-deb --build --root-owner-group dist/pkg "dist/projide_${VERSION}_amd64.deb"
 
 # ---------- RPM ----------
 mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-cp projide projide-app dist/staging/usr/bin/
+cp projide-app dist/staging/usr/bin/
 cp dist/proj-ide.svg dist/staging/usr/share/icons/hicolor/scalable/apps/proj-ide.svg
 tar -C dist/staging -cf ~/rpmbuild/SOURCES/projide-payload.tar .
 cat > ~/rpmbuild/SPECS/projide.spec <<SPEC
@@ -64,7 +64,7 @@ Release:        1%{?dist}
 Summary:        ProJ IDE — compact IDE with a local build engine
 License:        MIT
 BuildArch:      x86_64
-Requires:       webkit2gtk4.1, gtk3
+Requires:       fltk, fltk-fluid
 Recommends:     gcc-c++, python3
 
 %description
@@ -79,7 +79,6 @@ mkdir -p %{buildroot}/usr/bin %{buildroot}/usr/share/applications %{buildroot}/u
 tar -xf %{_sourcedir}/projide-payload.tar -C %{buildroot}
 
 %files
-/usr/bin/projide
 /usr/bin/projide-app
 /usr/share/applications/proj-ide.desktop
 /usr/share/icons/hicolor/scalable/apps/proj-ide.svg
@@ -87,10 +86,6 @@ SPEC
 rpmbuild -bb --target x86_64 ~/rpmbuild/SPECS/projide.spec >/tmp/rpmbuild.log 2>&1 || { tail -10 /tmp/rpmbuild.log; exit 1; }
 cp ~/rpmbuild/RPMS/x86_64/projide-$VERSION-1.*.rpm dist/
 
-# ---------- Windows zip ----------
-cd dist && zip -q ../dist/ProjIDE-win64.zip "../ProJ-IDE.exe" 2>/dev/null || zip -q ProjIDE-win64.zip "../ProJ-IDE.exe"; cd ..
-mv dist/ProjIDE-win64.zip dist/ProjIDE-win64.zip 2>/dev/null || true
-rm -f dist/ProjIDE-win64.zip
-cd dist && zip -q ProjIDE-win64.zip ProJ-IDE.exe; cd ..
+
 echo "=== dist/ ==="
-ls -la dist/*.deb dist/*.rpm dist/*.zip
+ls -la dist/*.deb dist/*.rpm

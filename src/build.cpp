@@ -114,7 +114,7 @@ static fs::path binary_path_for(const fs::path& src) {
     return out;
 }
 
-BuildResult build_file(const fs::path& src, const std::string& stdin_data) {
+BuildResult build_file(const fs::path& src, const std::string& stdin_data, bool debug) {
     BuildResult res;
     const Lang lang = lang_by_ext(src);
     const fs::path dir = src.parent_path();
@@ -143,17 +143,25 @@ BuildResult build_file(const fs::path& src, const std::string& stdin_data) {
     switch (lang) {
     case Lang::Cpp: {
         if (!util::find_in_path("g++", tool)) { res.log = "[нет компилятора g++]"; return res; }
-        auto r = run_cmd({tool.string(), "-std=c++20", "-Wall", "-Wextra",
-                          "-fdiagnostics-color=never", "-o",
-                          binary_path_for(src).string(), src.filename().string()});
+        std::vector<std::string> args = {tool.string(), "-std=c++20", "-Wall", "-Wextra",
+                                         "-fdiagnostics-color=never"};
+        if (debug) { args.push_back("-g"); args.push_back("-O0"); }
+        args.push_back("-o");
+        args.push_back(binary_path_for(src).string());
+        args.push_back(src.filename().string());
+        auto r = run_cmd(args);
         finish(r, "compile");
         return res;
     }
     case Lang::C: {
         if (!util::find_in_path("gcc", tool)) { res.log = "[нет компилятора gcc]"; return res; }
-        auto r = run_cmd({tool.string(), "-std=c17", "-Wall", "-Wextra",
-                          "-fdiagnostics-color=never", "-o",
-                          binary_path_for(src).string(), src.filename().string()});
+        std::vector<std::string> args = {tool.string(), "-std=c17", "-Wall", "-Wextra",
+                                         "-fdiagnostics-color=never"};
+        if (debug) { args.push_back("-g"); args.push_back("-O0"); }
+        args.push_back("-o");
+        args.push_back(binary_path_for(src).string());
+        args.push_back(src.filename().string());
+        auto r = run_cmd(args);
         finish(r, "compile");
         return res;
     }
@@ -187,4 +195,36 @@ BuildResult build_file(const fs::path& src, const std::string& stdin_data) {
         res.log = "[этот тип файла не компилируется]";
         return res;
     }
+}
+
+std::vector<BuildError> lint_file(const fs::path& src, const std::string& content) {
+    const Lang lang = lang_by_ext(src);
+    if (lang != Lang::Cpp && lang != Lang::C && lang != Lang::Python) return {};
+    // temp file sits next to the original so relative #include keeps working
+    fs::path tmp = src.parent_path() /
+                   ("." + src.filename().string() + ".lint" + src.extension().string());
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!f) return {};
+    }
+    std::vector<std::string> argv;
+    if (lang == Lang::Python)
+        argv = {"python3", "-m", "py_compile", tmp.string()};
+    else
+        argv = {lang == Lang::Cpp ? "g++" : "gcc",
+                std::string("-std=") + (lang == Lang::Cpp ? "c++20" : "c17"),
+                "-fsyntax-only", "-Wall", "-fdiagnostics-color=never", tmp.string()};
+#ifndef _WIN32
+    argv.insert(argv.begin(), {"env", "LC_ALL=C"});
+#endif
+    auto r = util::exec_capture(argv, src.parent_path(), 20);
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    auto diags = parse_compiler_log(r.out);
+    const std::string tmpname = tmp.filename().string();
+    for (auto& e : diags)
+        if (!e.file.empty() && fs::path(e.file).filename() == tmpname)
+            e.file = src.string();
+    return diags;
 }

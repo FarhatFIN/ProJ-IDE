@@ -5,11 +5,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
 
-add_executable(projide
-    src/util.cpp src/lang.cpp src/build.cpp src/store.cpp src/install.cpp
-    src/http.cpp src/jsonlite.cpp src/api.cpp src/server_main.cpp)
-target_link_libraries(projide PRIVATE Threads::Threads)
-
 find_package(FLTK QUIET)
 if(FLTK_FOUND)
     add_executable(projide-fltk

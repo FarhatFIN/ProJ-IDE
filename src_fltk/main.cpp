@@ -1,6 +1,7 @@
-// language: C++20, file: main.cpp, target: Linux/Windows/macOS, FLTK 1.3.11
-// ProJ IDE — desktop adaptation of the web UI (activity bar, palette, stdin,
-// status bar, breadcrumbs, problems/output/input panel). Local toolchain only.
+// language: C++20, file: main.cpp (src_fltk) — ProJ IDE native UI, FLTK 1.3.11
+// Fully native: no HTTP, no HTML. Engine: src/ (build, store, install, liveproc).
+// Features: projects, tabs, live run I/O, gdb/pdb debugger, real-time lint,
+// GitHub + directory import, themes, palette, save-on-exit dialog.
 #include <FL/Fl.H>
 #include <FL/Fl_Double_Window.H>
 #include <FL/Fl_Group.H>
@@ -25,14 +26,15 @@
 #include "highlight.hpp"
 #include "theme.hpp"
 #include "install.hpp"
+#include "liveproc.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -40,9 +42,8 @@
 
 // ---------------------------------------------------------------- CodeEditor
 
-// Fl_Text_Editor with a themed line-number gutter. Debian ships FLTK with the
-// old ABI where linenumber_bgcolor/fgcolor setters are no-ops, so after the
-// base draw() we repaint the gutter with our own palette.
+// Fl_Text_Editor with a themed line-number gutter (Debian FLTK ships the old
+// ABI where linenumber color setters are no-ops — repaint over the base draw).
 struct CodeEditor : Fl_Text_Editor {
     Fl_Color ln_bg = 0x22262cff;
     Fl_Color ln_fg = 0x9aa0a6ff;
@@ -86,6 +87,8 @@ struct CodeEditor : Fl_Text_Editor {
 
 // ---------------------------------------------------------------- state
 
+struct ErrRef { std::string path; int line = 0; int col = 0; };
+
 struct Session {
     Store store;
     int cur_proj = -1;
@@ -98,14 +101,21 @@ struct Session {
     std::map<std::string, bool> dirty;
 
     struct Row { int proj = -1; int file = -1; };
-    struct ErrRef { std::string path; int line = 0; int col = 0; };
-    std::vector<Row> rows;                       // parallel to explorer browser
+    std::vector<Row> rows;
     std::vector<ErrRef> err_refs;
 
-    std::vector<BuildError> diags;               // last build diagnostics
+    std::vector<BuildError> diags;
     int err_count = 0, warn_count = 0;
 
-    // widgets — chrome
+    // git import handshake between the worker thread and the modal loop
+    std::mutex import_mtx;
+    bool git_done = false;
+    bool git_result_ok = false;
+    std::string git_result_detail;
+    std::string git_result_name;
+    std::vector<fs::path> git_result_files;
+
+    // widgets
     Fl_Double_Window* win = nullptr;
     Fl_Group* titlebar = nullptr;
     Fl_Group* activity = nullptr;
@@ -114,13 +124,12 @@ struct Session {
     Fl_Button* act_settings = nullptr;
     Fl_Button* btn_palette = nullptr;
     Fl_Button* btn_start = nullptr;
+    Fl_Button* btn_debug = nullptr;
     Fl_Group* sidebar = nullptr;
     Fl_Group* view_explorer = nullptr;
     Fl_Group* view_run = nullptr;
     Fl_Group* view_settings = nullptr;
     Fl_Browser* browser = nullptr;
-    Fl_Button* btn_new_proj = nullptr;
-    Fl_Button* btn_add_files = nullptr;
     Fl_Button* btn_badge = nullptr;
     Fl_Browser* diag_list = nullptr;
     Fl_Group* tabstrip = nullptr;
@@ -134,29 +143,45 @@ struct Session {
     Fl_Browser* prob_list = nullptr;
     Fl_Text_Display* out_disp = nullptr;
     Fl_Text_Buffer* out_buf = nullptr;
-    Fl_Text_Editor* stdin_ed = nullptr;
-    Fl_Text_Buffer* stdin_buf = nullptr;
+    Fl_Group* proc_row = nullptr;
+    Fl_Input* proc_input = nullptr;
+    Fl_Button* btn_stop = nullptr;
     Fl_Button* status_err = nullptr;
     Fl_Box* status_right = nullptr;
     Fl_Round_Button* rb_dark = nullptr;
     Fl_Round_Button* rb_light = nullptr;
     Fl_Round_Button* rb_system = nullptr;
 
-    // palette window
     Fl_Double_Window* pal_win = nullptr;
     Fl_Input* pal_input = nullptr;
     Fl_Browser* pal_list = nullptr;
 
     int last_line = -1, last_col = -1;
     bool restyle_pending = false;
+    bool lint_busy = false;
+    bool lint_pending = false;
+
+    liveproc::LiveProc live;
+    bool live_running = false;
 } g;
 
 static constexpr int W = 1200, H = 720;
-static constexpr int ACT_X = 0, ACT_W = 44;
+static constexpr int ACT_W = 44;
 static constexpr int SB_X = 44, SB_W = 264;
 static constexpr int MAIN_X = 308;
 static constexpr int TITLE_H = 32, STATUS_H = 24, BOTTOM_H = 200;
 static constexpr int ERRBLOCK_H = 176;
+
+static void out_append(const std::string& text);
+
+// forward decls used across sections
+static void select_tab(const std::string& path);
+static void close_file(const std::string& path);
+static void add_files_flow(int project_idx);
+static void register_project_files(const std::string& name,
+                                   const std::vector<fs::path>& files);
+static void collect_text_files(const fs::path& dir, std::vector<fs::path>& out);
+void open_file(const std::string& path);
 
 // ---------------------------------------------------------------- helpers
 
@@ -220,7 +245,7 @@ static void refresh_activity() {
     g.activity->redraw();
 }
 
-static void show_view(int which) { // 0 explorer, 1 run, 2 settings
+static void show_view(int which) {
     g.view_explorer->show(); g.view_run->hide(); g.view_settings->hide();
     if (which == 1) { g.view_explorer->hide(); g.view_run->show(); }
     if (which == 2) { g.view_explorer->hide(); g.view_run->hide(); g.view_settings->show(); }
@@ -243,8 +268,8 @@ static void update_badges() {
 static void update_status_lang() {
     std::string right = "Стр " + std::to_string(std::max(1, g.last_line)) +
                         ", стлб " + std::to_string(std::max(1, g.last_col)) + "   UTF-8   ";
-    if (!g.cur_file.empty()) right += lang_name(lang_by_ext(fs::path(g.cur_file)));
-    else right += "—";
+    right += g.cur_file.empty() ? std::string("—")
+                                : lang_name(lang_by_ext(fs::path(g.cur_file)));
     g.status_right->copy_label(right.c_str());
     g.status_right->redraw();
 }
@@ -255,7 +280,6 @@ static void update_breadcrumb() {
         b = g.store.projects[g.cur_proj].name;
     if (!g.cur_file.empty()) {
         if (!b.empty()) b += "  ›  ";
-        // show path relative to the project's first file dir when possible
         b += fs::path(g.cur_file).filename().string();
     }
     g.breadcrumb->copy_label(b.c_str());
@@ -282,15 +306,6 @@ static void update_empty_state() {
     g.editor_area->redraw();
 }
 
-static void select_tab(const std::string& path);
-void extern_open(const std::string& path);
-static void close_file(const std::string& path);
-static void palette_fill_enter(const std::string& row_text);
-static void add_files_flow(int project_idx);
-static void start_cb(Fl_Widget*, void*);
-static void run_cb(Fl_Widget*, void*);
-static void save_cb(Fl_Widget*, void*);
-
 static void goto_line(const std::string& path, int line, int col) {
     auto it = g.bufs.find(path);
     if (it == g.bufs.end()) return;
@@ -302,7 +317,17 @@ static void goto_line(const std::string& path, int line, int col) {
     g.editor->take_focus();
 }
 
-// ---------------------------------------------------------------- restyle
+// ---------------------------------------------------------------- output
+
+static void out_append(const std::string& text) {
+    g.out_buf->append(text.c_str());
+    g.out_disp->insert_position(g.out_buf->length());
+    g.out_disp->show_insert_position();
+}
+
+// ---------------------------------------------------------------- restyle + lint
+
+static void lint_schedule();
 
 static void restyle_now() {
     g.restyle_pending = false;
@@ -316,6 +341,9 @@ static void restyle_now() {
 }
 
 static void restyle_timer_cb(void*) { restyle_now(); }
+
+static void lint_tick(void*);       // debounce fire → worker
+static void lint_apply_tick(void*); // poll worker result
 
 static void cursor_timer_cb(void*) {
     if (!g.cur_file.empty()) {
@@ -345,20 +373,17 @@ static void buf_modify_cb(int pos, int ins, int del, int restyled,
         g.restyle_pending = true;
         Fl::add_timeout(0.30, restyle_timer_cb, nullptr);
     }
+    lint_schedule();
 }
 
 // ---------------------------------------------------------------- diagnostics
 
-static std::vector<BuildError> diags_src; // diagnostics of the last build
-
 static void fill_errors() {
-    g.diags.clear();
-    g.err_refs.clear();
     g.err_count = g.warn_count = 0;
+    g.err_refs.clear();
     g.diag_list->clear();
     g.prob_list->clear();
-    for (const auto& e : diags_src) {
-        g.diags.push_back(e);
+    for (const auto& e : g.diags) {
         (e.is_error ? g.err_count : g.warn_count)++;
         const std::string icon = e.is_error ? "✖" : "⚠";
         std::string line = icon + "  ";
@@ -367,7 +392,6 @@ static void fill_errors() {
         g.diag_list->add(line.c_str());
         g.prob_list->add((line + (e.col > 0 ? "  [" + std::to_string(e.line) + ", " +
                                     std::to_string(e.col) + "]" : "")).c_str());
-        // gcc logs paths relative to the build dir — resolve against the built file
         fs::path fp(e.file);
         if (fp.empty()) fp = g.cur_file;
         else if (fp.is_relative()) fp = fs::path(g.cur_file).parent_path() / fp;
@@ -376,21 +400,16 @@ static void fill_errors() {
     update_badges();
 }
 
-static void store_diags(const BuildResult& res) {
-    diags_src = res.errors;
-    fill_errors();
-}
-
 static void diag_click_common(int line) {
     if (line <= 0 || line > static_cast<int>(g.err_refs.size())) return;
-    const auto& [path, ln, col] = g.err_refs[line - 1];
-    if (path.empty()) return;
-    if (g.bufs.find(path) == g.bufs.end()) extern_open(path);
-    else select_tab(path);
-    if (ln > 0) goto_line(path, ln, col);
+    const auto& ref = g.err_refs[line - 1];
+    if (ref.path.empty()) return;
+    if (g.bufs.find(ref.path) == g.bufs.end()) open_file(ref.path);
+    else select_tab(ref.path);
+    if (ref.line > 0) goto_line(ref.path, ref.line, ref.col);
 }
 
-// ---------------------------------------------------------------- file ops
+// ---------------------------------------------------------------- tabs / files
 
 static void select_tab(const std::string& path) {
     auto b = g.bufs.find(path);
@@ -410,11 +429,11 @@ static void select_tab(const std::string& path) {
     update_breadcrumb();
     update_status_lang();
     update_empty_state();
-    diags_src.clear();
+    g.diags.clear();
     fill_errors();
 }
 
-void extern_open(const std::string& path) {
+void open_file(const std::string& path) {
     if (g.bufs.count(path)) { select_tab(path); return; }
 
     auto buf = new Fl_Text_Buffer();
@@ -460,7 +479,7 @@ void extern_open(const std::string& path) {
     update_breadcrumb();
     update_status_lang();
     update_empty_state();
-    diags_src.clear();
+    g.diags.clear();
     fill_errors();
 }
 
@@ -515,8 +534,7 @@ static void rebuild_browser() {
     g.rows.clear();
     for (int i = 0; i < static_cast<int>(g.store.projects.size()); ++i) {
         const Project& p = g.store.projects[i];
-        std::string line = std::to_string(i + 1) + ".  " + p.name;
-        g.browser->add(line.c_str());
+        g.browser->add((std::to_string(i + 1) + ".  " + p.name).c_str());
         g.rows.push_back({i, -1});
         if (i == g.cur_proj) {
             for (const auto& f : p.files) {
@@ -544,7 +562,7 @@ static void browser_cb(Fl_Widget*, void*) {
         const Project& p = g.store.projects[row.proj];
         const fs::path f = p.files[row.file];
         g.cur_proj = row.proj;
-        if (f.string() != g.cur_file) extern_open(f.string());
+        if (f.string() != g.cur_file) open_file(f.string());
         else select_tab(f.string());
     } else {
         g.cur_proj = row.proj;
@@ -554,7 +572,7 @@ static void browser_cb(Fl_Widget*, void*) {
             bool ok = false;
             for (const auto& f : p.files) if (f == target) { ok = true; break; }
             if (!ok) target = p.files.front();
-            if (target.string() != g.cur_file) extern_open(target.string());
+            if (target.string() != g.cur_file) open_file(target.string());
             else select_tab(target.string());
         }
     }
@@ -584,7 +602,6 @@ static void browser_menu(int line) {
     const intptr_t id = (intptr_t)m->user_data();
 
     if (row.file >= 0 && id == 1) {
-        // remove file reference
         const Project& p = g.store.projects[row.proj];
         const fs::path f = p.files[row.file];
         if (fl_choice("Убрать «%s» из проекта?\n(файл на диске не удаляется)",
@@ -597,7 +614,7 @@ static void browser_menu(int line) {
         return;
     }
     if (row.file < 0) {
-        if (id == 3) { // delete project
+        if (id == 3) {
             const Project& p = g.store.projects[row.proj];
             if (fl_choice("Удалить проект «%s» из списка?\n(файлы на диске останутся)",
                           "Отмена", "Удалить", nullptr, p.name.c_str()) != 1) return;
@@ -610,7 +627,7 @@ static void browser_menu(int line) {
             return;
         }
         if (id == 2) { add_files_flow(row.proj); return; }
-        if (id == 1) { // new file inside project
+        if (id == 1) {
             const Project& p = g.store.projects[row.proj];
             std::string def = p.files.empty()
                 ? (util::home_dir() / "main.cpp").string()
@@ -627,27 +644,157 @@ static void browser_menu(int line) {
             g.cur_proj = row.proj;
             g.store.save();
             rebuild_browser();
-            extern_open(nf.string());
+            open_file(nf.string());
         }
     }
 }
 
-// ---------------------------------------------------------------- files add
+// ---------------------------------------------------------------- imports
 
-static std::vector<fs::path> pick_files() {
+// text files of a directory tree; binaries and junk dirs skipped
+static void collect_text_files(const fs::path& dir, std::vector<fs::path>& out) {
+    static const char* skip[] = {".git", "node_modules", "__pycache__", "build",
+                                 "dist", ".idea", ".vscode", "cmake-build-debug"};
+    std::error_code ec;
+    fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+    fs::recursive_directory_iterator end;
+    while (it != end) {
+        const fs::path p = it->path();
+        const std::string fn = p.filename().string();
+        bool skipn = false;
+        for (const char* sname : skip) if (fn == sname) { skipn = true; break; }
+        if (it->is_directory(ec)) {
+            if (skipn) it.disable_recursion_pending();
+        } else if (!skipn) {
+            auto sz = it->file_size(ec);
+            if (!ec && sz > 0 && sz <= 4 * 1024 * 1024) {
+                std::ifstream f(p, std::ios::binary);
+                char b[512] = {0};
+                f.read(b, sizeof(b));
+                if (f.gcount() <= 0 || !std::memchr(b, 0, static_cast<size_t>(f.gcount())))
+                    out.push_back(p);
+            }
+        }
+        it.increment(ec);
+    }
+}
+
+static void register_project_files(const std::string& name,
+                                   const std::vector<fs::path>& files) {
+    g.store.add_project(name, files);
+    g.cur_proj = static_cast<int>(g.store.projects.size()) - 1;
+    g.store.save();
+    rebuild_browser();
+    if (!files.empty()) open_file(files.front().string());
+    update_title();
+    update_empty_state();
+}
+
+static void import_git_dialog() {
+    fs::path gitp;
+    if (!util::find_in_path("git", gitp)) {
+        fl_alert("git не найден в PATH.\nУстанови: sudo apt install git");
+        return;
+    }
+    Fl_Window dlg(480, 140, "Импорт репозитория GitHub");
+    dlg.set_modal();
+    Fl_Box lab(16, 14, 448, 22, "URL репозитория (https://github.com/...):");
+    lab.align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+    Fl_Input in(16, 40, 448, 26);
+    in.value("https://github.com/");
+    auto* okbtn = new Fl_Button(360, 78, 104, 26, "Клонировать");
+    okbtn->callback([](Fl_Widget* w, void*) {
+        w->window()->user_data((void*)1);
+        w->window()->hide();
+    });
+    dlg.end();
+
+    dlg.show();
+    while (dlg.visible_r()) Fl::wait();
+    if ((intptr_t)dlg.user_data() != 1) return;
+    std::string url = util::trim(in.value());
+    if (url.empty()) return;
+
+    std::string name = url.substr(url.find_last_of('/') + 1);
+    if (name.size() > 4 && name.rfind(".git") == name.size() - 4)
+        name.resize(name.size() - 4);
+    if (name.empty()) name = "repo";
+
+    std::atomic<bool> done{false};
+    std::thread worker([&]() {
+        fs::path target = util::home_dir() / "ProJ-IDE-Projects" / name;
+        std::error_code ec;
+        fs::remove_all(target, ec);
+        auto r = util::exec_capture({"git", "clone", "--depth", "1", url, target.string()},
+                                    std::nullopt, 600);
+        std::vector<fs::path> files;
+        if (r.exit_code == 0) collect_text_files(target, files);
+        std::lock_guard<std::mutex> lk(g.import_mtx);
+        g.git_result_ok = (r.exit_code == 0);
+        g.git_result_detail = r.exit_code == 0 ? ""
+                              : (r.out.empty() ? "git clone не удался" : r.out);
+        g.git_result_files = files;
+        g.git_result_name = name;
+        g.git_done = true;
+        done.store(true);
+    });
+    worker.detach();
+
+    Fl_Window prog(380, 110, "Клонирование");
+    prog.set_modal();
+    Fl_Box st(16, 16, 348, 40, "git clone…");
+    st.align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_WRAP);
+    Fl_Progress bar(16, 70, 348, 20);
+    bar.minimum(0); bar.maximum(1); bar.value(0);
+    prog.end();
+    prog.show();
+    double pulse = 0;
+    while (!done.load()) {
+        Fl::wait(0.08);
+        pulse = std::fmod(pulse + 0.03, 1.0);
+        bar.value(pulse);
+    }
+    prog.hide();
+
+    bool ok = false;
+    std::vector<fs::path> files;
+    std::string detail;
+    {
+        std::lock_guard<std::mutex> lk(g.import_mtx);
+        ok = g.git_result_ok;
+        files = g.git_result_files;
+        detail = g.git_result_detail;
+        g.git_done = false;
+    }
+    if (!ok) {
+        fl_alert("Не удалось клонировать:\n%s", detail.c_str());
+        return;
+    }
+    // re-import of an existing name replaces its file list
+    bool exists = false;
+    for (auto& prj : g.store.projects) if (prj.name == name) { exists = true; break; }
+    if (exists) {
+        for (int i = 0; i < static_cast<int>(g.store.projects.size()); ++i)
+            if (g.store.projects[i].name == name) {
+                for (const auto& f : g.store.projects[i].files) close_file(f.string());
+                g.store.remove_project(i);
+                break;
+            }
+    }
+    register_project_files(name, files);
+}
+
+static void github_import_cb(Fl_Widget*, void*) { import_git_dialog(); }
+
+static void add_files_flow(int project_idx) {
     Fl_Native_File_Chooser chooser;
     chooser.title("Выберите файлы");
     chooser.type(Fl_Native_File_Chooser::BROWSE_MULTI_FILE);
     chooser.filter("*\tВсе файлы (*)");
-    if (chooser.show() != 0) return {};
-    std::vector<fs::path> out;
+    if (chooser.show() != 0) return;
+    std::vector<fs::path> files;
     for (int i = 0; i < chooser.count(); ++i)
-        out.push_back(fs::path(chooser.filename(i)));
-    return out;
-}
-
-static void add_files_flow(int project_idx) {
-    std::vector<fs::path> files = pick_files();
+        files.push_back(fs::path(chooser.filename(i)));
     if (files.empty()) return;
     const bool have = project_idx >= 0 &&
                       project_idx < static_cast<int>(g.store.projects.size());
@@ -663,7 +810,7 @@ static void add_files_flow(int project_idx) {
     }
     g.store.save();
     rebuild_browser();
-    if (!files.empty()) extern_open(files.front().string());
+    if (!files.empty()) open_file(files.front().string());
     update_title();
     update_empty_state();
 }
@@ -701,6 +848,8 @@ static void save_cb(Fl_Widget*, void*) { do_save(false); }
 
 // ---------------------------------------------------------------- palette
 
+static void palette_fill_enter(const std::string& row_text);
+
 static void palette_fill(const std::string& filter) {
     g.pal_list->clear();
     const std::string f = util::to_lower(filter);
@@ -723,7 +872,7 @@ static void palette_open() {
         g.pal_win->set_modal();
         auto* in = new Fl_Input(10, 10, 500, 28);
         in->callback([](Fl_Widget* w, void*) {
-            if (Fl::event_key() == FL_Enter) { // FL_WHEN_ENTER_KEY: open top row
+            if (Fl::event_key() == FL_Enter) {
                 g.pal_list->value(g.pal_list->value() ? g.pal_list->value() : 1);
                 const char* t = g.pal_list->text(g.pal_list->value());
                 if (t) palette_fill_enter(std::string(t));
@@ -738,7 +887,7 @@ static void palette_open() {
         list->callback([](Fl_Widget* w, void*) {
             auto* br = static_cast<Fl_Browser*>(w);
             const char* t = br->text(br->value());
-            if (t) palette_fill_enter(std::string(t)); // single click opens
+            if (t) palette_fill_enter(std::string(t));
         });
         g.pal_input = in;
         g.pal_list = list;
@@ -750,10 +899,7 @@ static void palette_open() {
     g.pal_input->take_focus();
 }
 
-// opens the file for the currently highlighted palette row
 static void palette_fill_enter(const std::string& row_text) {
-    // row format: "  name    — project"
-    // row: "  <file>    — <project>" — slice AFTER the full 3-byte em-dash
     const size_t dash = row_text.find("—");
     if (dash == std::string::npos) return;
     std::string fname = util::trim(row_text.substr(0, dash));
@@ -765,7 +911,7 @@ static void palette_fill_enter(const std::string& row_text) {
                 g.cur_proj = i;
                 g.store.save();
                 rebuild_browser();
-                extern_open(f.string());
+                open_file(f.string());
                 if (g.pal_win) g.pal_win->hide();
                 return;
             }
@@ -775,9 +921,9 @@ static void palette_fill_enter(const std::string& row_text) {
 
 static void palette_cb(Fl_Widget*, void*) { palette_open(); }
 
-// ---------------------------------------------------------------- build flow
+// ---------------------------------------------------------------- build + live
 
-static void start_cb(Fl_Widget*, void*);
+
 
 static bool install_flow(const std::string& tool) {
     Fl_Window dlg(380, 130, "Установка компилятора");
@@ -843,14 +989,54 @@ static bool install_flow(const std::string& tool) {
     return true;
 }
 
-static void show_panel(int which) { // 0 problems, 1 output, 2 input
+static bool ensure_tool(const std::string& tool) {
+    std::string ver;
+    if (install::tool_present(tool, ver)) return true;
+    std::string q = std::string("У вас не нашлось \"") + tool +
+                    "\".\nМы можем скачать его из доверенных источников.";
+    if (fl_choice(q.c_str(), "Выйти", "Разрешаю", nullptr) != 1) return false;
+    return install_flow(tool);
+}
+
+static void show_panel(int which) { // 0 problems, 1 output
     if (which == 0) g.bottom_tabs->value(g.bottom_tabs->child(0));
     if (which == 1) g.bottom_tabs->value(g.bottom_tabs->child(1));
-    if (which == 2) g.bottom_tabs->value(g.bottom_tabs->child(2));
     g.bottom_tabs->redraw();
 }
 
-static void start_cb(Fl_Widget*, void*) {
+// ---- live process plumbing ----
+
+static void live_poll_cb(void*) {
+    std::string chunk;
+    const bool running = g.live.read_chunk(chunk);
+    if (!chunk.empty()) out_append(chunk);
+    if (running) {
+        Fl::repeat_timeout(0.3, live_poll_cb);
+    } else {
+        g.live_running = false;
+        g.proc_row->hide();
+        out_append("\n■ программа завершилась\n");
+        update_status_lang();
+    }
+}
+
+static void live_run(const std::vector<std::string>& argv, const std::string& cwd,
+                     const std::string& header) {
+    if (!g.live.start(argv, cwd)) {
+        out_append("\n✖ не удалось запустить процесс\n");
+        return;
+    }
+    g.live_running = true;
+    out_append(header);
+    g.proc_row->show();
+    g.proc_input->take_focus();
+    update_status_lang();
+    Fl::add_timeout(0.3, live_poll_cb);
+}
+
+
+
+static void start_cb_impl(bool debug_mode) {
     if (g.cur_file.empty()) {
         fl_alert("Нет открытого файла.\nДобавьте файлы через «+ Добавить файлы».");
         return;
@@ -861,21 +1047,21 @@ static void start_cb(Fl_Widget*, void*) {
         fl_alert("Тип файла «%s» не компилируется.", lang_name(lang));
         return;
     }
+    if (g.live_running) g.live.kill(); // новый запуск прибивает предыдущий
     do_save(true);
 
     const std::string tool = tool_for(lang);
-    std::string ver;
-    if (!install::tool_present(tool, ver)) {
-        std::string q = std::string("У вас не нашлось \"") + tool +
-                        "\".\nМы можем скачать его из доверенных источников.";
-        if (fl_choice(q.c_str(), "Выйти", "Разрешаю", nullptr) != 1) return;
-        if (!install_flow(tool)) return;
+    if (!ensure_tool(tool)) return;
+    if (debug_mode && (lang == Lang::Cpp || lang == Lang::C)) {
+        if (!ensure_tool("gdb")) return;
     }
 
-    const std::string stdin_text = g.stdin_buf->text();
-    BuildResult res = build_file(src, stdin_text);
-    g.out_buf->text(res.log.c_str());
-    store_diags(res);
+    show_panel(1);
+    out_append("▶ " + src.filename().string() + "\nСборка…\n");
+    BuildResult res = build_file(src, "", debug_mode);
+    out_append(res.log + "\n");
+    g.diags = res.errors;
+    fill_errors();
 
     if (!res.ok) {
         show_panel(0);
@@ -896,59 +1082,41 @@ static void start_cb(Fl_Widget*, void*) {
         const int go = fl_choice("Ошибка компиляции — строка %s\n%s", "Закрыть",
                                  "Перейти", nullptr, first_num.c_str(), first_msg.c_str());
         if (go == 1 && first_line > 0) goto_line(first_path, first_line, first_col);
-    } else {
-        show_panel(1);
-        if (res.log.empty()) g.out_buf->text("Сборка успешна.");
-        else g.out_buf->append("\n— Сборка успешна.\n");
-        // python: run right here with the stdin panel content (web-parity)
-        if (lang == Lang::Python) {
-            auto r = util::exec_capture({std::string("python3"), "-X", "utf8",
-                                         src.filename().string()},
-                                        src.parent_path(), 30, stdin_text);
-            std::string out = r.out;
-            if (r.timed_out) out += "\n[превышено время 30 с — процесс остановлен]";
-            g.out_buf->append(("$ python3 " + src.filename().string() + "\n" +
-                               (out.empty() ? "(вывода нет)" : out) + "\n").c_str());
-        }
-    }
-}
-
-static void run_cb(Fl_Widget*, void*) {
-    if (g.cur_file.empty()) return;
-    const fs::path src(g.cur_file);
-    const Lang lang = lang_by_ext(src);
-    std::string cmd;
-    switch (lang) {
-    case Lang::Python:
-        cmd = "python3 '" + util::replace_all(src.string(), "'", "'\\''") + "'";
-        break;
-    case Lang::Cpp: case Lang::C: case Lang::Asm: {
-        fs::path bin = bin_path(src);
-        std::error_code ec;
-        if (!fs::exists(bin, ec)) {
-            fl_alert("Сначала соберите файл кнопкой «Старт».");
-            return;
-        }
-        cmd = "'" + util::replace_all(bin.string(), "'", "'\\''") + "'";
-        break;
-    }
-    default:
-        fl_alert("Этот файл нельзя запустить.");
         return;
     }
-    util::run_detached_terminal(cmd, src.parent_path());
+
+    out_append("✔ Собрано\n");
+    std::vector<std::string> argv;
+    std::string cwd = src.parent_path().string();
+    std::string header;
+    if (debug_mode) {
+        if (lang == Lang::Python) {
+            argv = {"python3", "-m", "pdb", src.string()};
+            header = "$ python3 -m pdb  (run · n · p var · bt · q)\n";
+        } else {
+            argv = {"gdb", "-q", res.produced.string()};
+            header = "$ gdb  (run · break main · n · p var · bt · q)\n";
+        }
+    } else if (lang == Lang::Python) {
+        argv = {"python3", "-X", "utf8", src.string()};
+        header = "$ python3 " + src.filename().string() + "\n";
+    } else {
+        argv = {res.produced.string()};
+        header = "$ " + res.produced.filename().string() + "\n";
+    }
+    live_run(argv, cwd, header);
 }
+
+static void start_cb3(Fl_Widget*, void*, bool debug_mode) { start_cb_impl(debug_mode); }
 
 // ---------------------------------------------------------------- errors click
 
 static void diag_list_cb(Fl_Widget* w, void*) {
-    auto* br = static_cast<Fl_Browser*>(w);
-    diag_click_common(br->value());
+    diag_click_common(static_cast<Fl_Browser*>(w)->value());
 }
 
 static void prob_list_cb(Fl_Widget* w, void*) {
-    auto* br = static_cast<Fl_Browser*>(w);
-    diag_click_common(br->value());
+    diag_click_common(static_cast<Fl_Browser*>(w)->value());
 }
 
 static void badge_cb(Fl_Widget*, void*) {
@@ -964,7 +1132,6 @@ static void apply_theme_ui(ThemeMode mode) {
     theme::apply(mode, g.win);
     g.editor->ln_bg = theme::ed_bg();
     g.editor->ln_fg = theme::fg_dim();
-    // chrome strips
     const auto setg = [](Fl_Group* grp, Fl_Color c) {
         if (grp) { grp->color(c); grp->redraw(); }
     };
@@ -983,16 +1150,29 @@ static void apply_theme_ui(ThemeMode mode) {
 }
 
 static void theme_radio_cb(Fl_Widget* /*w*/, void* data) {
-    const intptr_t mode = (intptr_t)data; // 0 dark, 1 light, 2 system
+    const intptr_t mode = (intptr_t)data;
     apply_theme_ui(mode == 0 ? ThemeMode::Dark :
                    mode == 1 ? ThemeMode::Light : ThemeMode::System);
 }
 
-// ---------------------------------------------------------------- activity
-
 static void act_cb(Fl_Widget* /*w*/, void* data) {
-    const intptr_t v = (intptr_t)data;
-    show_view(static_cast<int>(v));
+    show_view(static_cast<int>((intptr_t)data));
+}
+
+// ---------------------------------------------------------------- quit
+
+static void quit_cb(Fl_Widget*, void*) {
+    bool any_dirty = false;
+    for (auto& [path, d] : g.dirty) if (d) { any_dirty = true; break; }
+    if (any_dirty) {
+        const int r = fl_choice("Сохранить изменения перед выходом?",
+                                "Не сохранять", "Сохранить", nullptr);
+        if (r == 1)
+            for (auto& [path, b] : g.bufs) b->savefile(path.c_str());
+    }
+    g.store.set_last(g.cur_proj, fs::path(g.cur_file));
+    g.store.save();
+    g.win->hide();
 }
 
 // ---------------------------------------------------------------- overlay
@@ -1008,29 +1188,66 @@ struct Overlay : Fl_Group {
     }
 };
 
-// ---------------------------------------------------------------- quit
+// ---------------------------------------------------------------- lint impl
 
-static void quit_cb(Fl_Widget*, void*) {
-    bool any_dirty = false;
-    for (auto& [path, d] : g.dirty) if (d) { any_dirty = true; break; }
-    if (any_dirty) {
-        const int r = fl_choice("Есть несохранённые изменения. Сохранить всё перед выходом?",
-                                "Выйти без сохранения", "Сохранить и выйти", "Отмена");
-        if (r == 2) return;
-        if (r == 1) for (auto& [path, b] : g.bufs) b->savefile(path.c_str());
-    }
-    g.store.set_last(g.cur_proj, fs::path(g.cur_file));
-    g.store.save();
-    g.win->hide();
+static std::mutex g_lint_mtx;
+static bool g_lint_ready = false;
+static std::string g_lint_path;
+static std::vector<BuildError> g_lint_diags;
+
+static void lint_apply_tick(void*);
+
+static void lint_tick(void*) {
+    if (!g.lint_pending || g.lint_busy || g.cur_file.empty()) return;
+    g.lint_pending = false;
+    const std::string path = g.cur_file;
+    auto b = g.bufs.find(path);
+    if (b == g.bufs.end()) return;
+    const std::string content = b->second->text();
+    g.lint_busy = true;
+    std::thread([path, content]() {
+        auto diags = lint_file(fs::path(path), content);
+        std::lock_guard<std::mutex> lk(g_lint_mtx);
+        g_lint_path = path;
+        g_lint_diags = std::move(diags);
+        g_lint_ready = true;
+    }).detach();
+    Fl::add_timeout(0.08, lint_apply_tick);
 }
 
-// ---------------------------------------------------------------- build UI
+static void lint_apply_tick(void*) {
+    bool ready = false;
+    {
+        std::lock_guard<std::mutex> lk(g_lint_mtx);
+        ready = g_lint_ready;
+    }
+    if (!ready) { Fl::add_timeout(0.08, lint_apply_tick); return; }
+
+    std::string path;
+    std::vector<BuildError> diags;
+    {
+        std::lock_guard<std::mutex> lk(g_lint_mtx);
+        path = g_lint_path;
+        diags = g_lint_diags;
+        g_lint_ready = false;
+    }
+    g.lint_busy = false;
+
+    if (path != g.cur_file) return;   // switched away — drop
+    if (!g.diags.empty()) return;     // build errors on screen take priority
+    g.diags = diags;
+    fill_errors();
+}
+
+static void lint_schedule() {
+    g.lint_pending = true;
+    Fl::remove_timeout(lint_tick);
+    Fl::add_timeout(1.0, lint_tick);
+}
+
+// ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {
-#ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
     Fl::scheme("gtk+");
     g.store.load();
 
@@ -1039,40 +1256,42 @@ int main(int argc, char** argv) {
     win->size_range(900, 560);
     win->callback(quit_cb);
 
-    // ---- title bar ----
     {
         auto* tb = new Fl_Group(0, 0, W, TITLE_H);
         tb->box(FL_FLAT_BOX);
         g.titlebar = tb;
-        auto* logo = new Fl_Box(8, 4, 80, 24, "ProJ IDE");
+        auto* logo = new Fl_Box(8, 4, 76, 24, "ProJ IDE");
         logo->labelfont(FL_BOLD + FL_COURIER);
         logo->labelsize(13);
-        auto* pal = new Fl_Button(140, 5, 340, 22, "Поиск файлов…   Ctrl+P");
+        auto* pal = new Fl_Button(120, 5, 300, 22, "Поиск файлов…   Ctrl+P");
         pal->box(FL_THIN_UP_BOX);
         pal->labelsize(11);
         pal->shortcut(FL_COMMAND + 'p');
         pal->callback(palette_cb);
-        g.btn_palette = pal;
-        auto* save = new Fl_Button(W - 236, 5, 108, 22, "Сохранить");
-        save->shortcut(FL_COMMAND + 's');
-        save->tooltip("Ctrl+S");
-        save->callback(save_cb);
-        auto* start = new Fl_Button(W - 120, 5, 112, 22, "▶  Старт");
+        auto* sv = new Fl_Button(W - 344, 5, 104, 22, "Сохранить");
+        sv->shortcut(FL_COMMAND + 's');
+        sv->tooltip("Ctrl+S");
+        sv->callback(save_cb);
+        auto* dbg = new Fl_Button(W - 232, 5, 104, 22, "Отладка");
+        dbg->tooltip("Собрать с -g -O0 и открыть gdb (python — pdb)");
+        dbg->callback([](Fl_Widget*, void*) { start_cb_impl(true); });
+        auto* start = new Fl_Button(W - 120, 5, 112, 22, "▶  Запуск");
         start->shortcut(FL_COMMAND + 'b');
         start->labelfont(FL_BOLD);
-        start->tooltip("Скомпилировать (Ctrl+B) · Ctrl+Enter тоже");
-        start->callback(start_cb);
+        start->tooltip("Собрать и выполнить (Ctrl+B)");
+        start->callback([](Fl_Widget*, void*) { start_cb_impl(false); });
+        g.btn_palette = pal;
+        g.btn_debug = dbg;
         g.btn_start = start;
         tb->end();
     }
 
-    // ---- activity bar ----
     {
-        auto* act = new Fl_Group(ACT_X, TITLE_H, ACT_W, H - TITLE_H - STATUS_H);
+        auto* act = new Fl_Group(0, TITLE_H, ACT_W, H - TITLE_H - STATUS_H);
         act->box(FL_FLAT_BOX);
         g.activity = act;
         const auto mk = [&](int y, const char* label, intptr_t id, const char* tip) {
-            auto* b = new Fl_Button(ACT_X, TITLE_H + y, ACT_W, 40, label);
+            auto* b = new Fl_Button(0, TITLE_H + y, ACT_W, 40, label);
             b->box(FL_FLAT_BOX);
             b->labelsize(16);
             b->tooltip(tip);
@@ -1080,24 +1299,22 @@ int main(int argc, char** argv) {
             return b;
         };
         g.act_explorer = mk(6, "☰", 0, "Проводник");
-        g.act_run = mk(50, "▶", 1, "Запуск");
+        g.act_run = mk(50, "▶", 1, "Запуск и отладка");
         g.act_settings = mk(94, "⚙", 2, "Настройки");
         act->end();
     }
 
-    // ---- sidebar ----
     {
         auto* sb = new Fl_Group(SB_X, TITLE_H, SB_W, H - TITLE_H - STATUS_H);
         sb->box(FL_FLAT_BOX);
         g.sidebar = sb;
 
-        // explorer view
+        const int vh = H - TITLE_H - STATUS_H - ERRBLOCK_H;
         {
-            const int vh = H - TITLE_H - STATUS_H - ERRBLOCK_H;
             auto* v = new Fl_Group(SB_X, TITLE_H, SB_W, vh);
             v->box(FL_FLAT_BOX);
             g.view_explorer = v;
-            auto* hdr = new Fl_Box(SB_X + 8, TITLE_H + 4, 120, 20, "ПРОЕКТЫ");
+            auto* hdr = new Fl_Box(SB_X + 8, TITLE_H + 4, 100, 20, "ПРОЕКТЫ");
             hdr->labelfont(FL_BOLD);
             hdr->labelsize(10);
             hdr->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
@@ -1112,7 +1329,32 @@ int main(int argc, char** argv) {
             af->labelsize(9);
             af->tooltip("+ Добавить файлы");
             af->callback(add_cb);
-            auto* br = new Fl_Browser(SB_X, TITLE_H + 26, SB_W, vh - 26);
+            auto* gi = new Fl_Button(SB_X + 6, TITLE_H + 26, (SB_W - 18) / 2, 22, "Импорт GitHub");
+            gi->box(FL_THIN_UP_BOX);
+            gi->labelsize(10);
+            gi->tooltip("git clone репозитория — все текстовые файлы в проект");
+            gi->callback([](Fl_Widget*, void*) { import_git_dialog(); });
+            auto* di = new Fl_Button(SB_X + 12 + (SB_W - 18) / 2, TITLE_H + 26,
+                                     (SB_W - 18) / 2, 22, "Папка");
+            di->box(FL_THIN_UP_BOX);
+            di->labelsize(10);
+            di->tooltip("Импорт целой папки (все текстовые файлы)");
+            di->callback([](Fl_Widget*, void*) {
+                Fl_Native_File_Chooser ch;
+                ch.title("Выбери папку проекта");
+                ch.type(Fl_Native_File_Chooser::BROWSE_DIRECTORY);
+                if (ch.show() != 0) return;
+                fs::path dir(ch.filename());
+                std::vector<fs::path> files;
+                collect_text_files(dir, files);
+                if (files.empty()) {
+                    fl_alert("В папке нет текстовых файлов исходников:\n%s",
+                             dir.string().c_str());
+                    return;
+                }
+                register_project_files(dir.filename().string(), files);
+            });
+            auto* br = new Fl_Browser(SB_X, TITLE_H + 52, SB_W, vh - 52);
             br->when(FL_WHEN_CHANGED);
             br->callback(browser_cb);
             br->textsize(12);
@@ -1120,7 +1362,6 @@ int main(int argc, char** argv) {
             g.browser = br;
             v->end();
 
-            // errors block (bottom of sidebar, anchored bottom-right via add-after)
             auto* eb = new Fl_Group(SB_X, TITLE_H + vh, SB_W, ERRBLOCK_H);
             eb->box(FL_FLAT_BOX);
             auto* badge = new Fl_Button(SB_X + 8, TITLE_H + vh + 6, 96, 20, "Errors<0>");
@@ -1139,50 +1380,48 @@ int main(int argc, char** argv) {
             eb->end();
         }
 
-        // run view
         {
-            const int vh = H - TITLE_H - STATUS_H;
-            auto* v = new Fl_Group(SB_X, TITLE_H, SB_W, vh);
+            const int vh2 = H - TITLE_H - STATUS_H;
+            auto* v = new Fl_Group(SB_X, TITLE_H, SB_W, vh2);
             v->box(FL_FLAT_BOX);
             g.view_run = v;
             v->hide();
-            auto* hdr = new Fl_Box(SB_X + 12, TITLE_H + 8, SB_W - 24, 20, "ЗАПУСК");
+            auto* hdr = new Fl_Box(SB_X + 12, TITLE_H + 8, SB_W - 24, 20, "ЗАПУСК И ОТЛАДКА");
             hdr->labelfont(FL_BOLD);
             hdr->labelsize(10);
             hdr->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
             hdr->labelcolor(theme::fg_dim());
-            auto* st = new Fl_Button(SB_X + 12, TITLE_H + 34, SB_W - 24, 28, "▶  Старт");
+            auto* st = new Fl_Button(SB_X + 12, TITLE_H + 34, SB_W - 24, 28, "▶  Запуск");
             st->labelfont(FL_BOLD);
-            st->callback(start_cb);
+            st->callback([](Fl_Widget*, void*) { start_cb_impl(false); });
             st->shortcut(FL_COMMAND + 'b');
-            auto* trm = new Fl_Button(SB_X + 12, TITLE_H + 68, SB_W - 24, 24, "Запуск в терминале");
-            trm->callback(run_cb);
-            trm->tooltip("Бинарник/скрипт в отдельном терминале (интерактивный stdin)");
-            auto* info = new Fl_Box(SB_X + 12, TITLE_H + 100, SB_W - 24, 150,
+            auto* trm = new Fl_Button(SB_X + 12, TITLE_H + 68, SB_W - 24, 24, "Отладка (gdb / pdb)");
+            trm->callback([](Fl_Widget*, void*) { start_cb_impl(true); });
+            trm->tooltip("Сборка с -g -O0 и отладчик в панели «Вывод»");
+            auto* info = new Fl_Box(SB_X + 12, TITLE_H + 100, SB_W - 24, 170,
                 "C++    g++ -std=c++20 -Wall -Wextra\n"
                 "C      gcc -std=c17 -Wall -Wextra\n"
-                "Python python3 + ввод из панели\n"
-                "NASM   nasm + gcc (elf64/win64/macho64)\n\n"
-                "Сборка локальная. Python после\n"
-                "сборки запускается прямо в панели\n"
-                "«Вывод» с данными из «Ввод».\n"
-                "Бинарники: кнопка «Запуск»\n"
-                "открывает терминал.");
+                "Python py_compile + запуск\n"
+                "NASM   nasm + gcc\n\n"
+                "Программа живёт в панели «Вывод»:\n"
+                "вывод стримится, ввод — в строке\n"
+                "внизу панели, Enter отправляет.\n\n"
+                "gdb: run · break main · n · p var · bt · q\n"
+                "pdb: run · n · p var · b 12 · c · q");
             info->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_TOP | FL_ALIGN_WRAP);
             info->labelsize(11);
             info->labelcolor(theme::fg_dim());
-            auto* keys = new Fl_Box(SB_X + 12, TITLE_H + vh - 70, SB_W - 24, 60,
-                "Ctrl+B / Ctrl+Enter — старт\nCtrl+S — сохранить\nCtrl+P — найти файл");
+            auto* keys = new Fl_Box(SB_X + 12, TITLE_H + vh2 - 66, SB_W - 24, 56,
+                "Ctrl+B — запуск · Ctrl+S — сохранить\nCtrl+P — найти файл");
             keys->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_TOP | FL_ALIGN_WRAP);
             keys->labelsize(11);
             keys->labelcolor(theme::fg_dim());
             v->end();
         }
 
-        // settings view
         {
-            const int vh = H - TITLE_H - STATUS_H;
-            auto* v = new Fl_Group(SB_X, TITLE_H, SB_W, vh);
+            const int vh3 = H - TITLE_H - STATUS_H;
+            auto* v = new Fl_Group(SB_X, TITLE_H, SB_W, vh3);
             v->box(FL_FLAT_BOX);
             g.view_settings = v;
             v->hide();
@@ -1207,12 +1446,10 @@ int main(int argc, char** argv) {
         sb->end();
     }
 
-    // ---- main area (resizable) ----
     {
         auto* main = new Fl_Group(MAIN_X, TITLE_H, W - MAIN_X, H - TITLE_H - STATUS_H);
         win->resizable(main);
 
-        // tabs row
         {
             auto* row = new Fl_Group(MAIN_X, TITLE_H, W - MAIN_X, 30);
             row->box(FL_FLAT_BOX);
@@ -1231,7 +1468,6 @@ int main(int argc, char** argv) {
             g.btn_close_tab = close;
         }
 
-        // breadcrumb
         {
             auto* bc = new Fl_Box(MAIN_X + 12, TITLE_H + 31, W - MAIN_X - 24, 18, "");
             bc->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
@@ -1240,9 +1476,8 @@ int main(int argc, char** argv) {
             g.breadcrumb = bc;
         }
 
-        // editor + overlay
         {
-            const int ed_h = H - TITLE_H - STATUS_H - 30 - 20 - BOTTOM_H;
+            const int ed_h = H - TITLE_H - STATUS_H - 50 - BOTTOM_H;
             auto* area = new Fl_Group(MAIN_X, TITLE_H + 50, W - MAIN_X, ed_h + 20);
             main->resizable(area);
             g.editor_area = area;
@@ -1265,7 +1500,7 @@ int main(int argc, char** argv) {
             big_logo->labelsize(42);
             big_logo->align(FL_ALIGN_CENTER);
             auto* hint = new Fl_Box(0, 64, 340, 24,
-                                    "Ctrl+P — открыть файл · Ctrl+B — старт");
+                                    "Ctrl+P — открыть файл · Ctrl+B — запуск");
             hint->labelsize(12);
             hint->labelcolor(theme::fg_dim());
             auto* add = new Fl_Button(70, 96, 200, 30, "+  Добавить файлы");
@@ -1276,20 +1511,21 @@ int main(int argc, char** argv) {
             g.empty_state = overlay;
             g.btn_empty_add = add;
 
-            // bottom panel
             {
-                auto* bt = new Fl_Tabs(MAIN_X, TITLE_H + 51 + ed_h + 1, W - MAIN_X, BOTTOM_H - 1);
+                const int tabs_y = TITLE_H + 51 + ed_h + 1;
+                auto* bt = new Fl_Tabs(MAIN_X, tabs_y, W - MAIN_X, BOTTOM_H - 26);
                 g.bottom_tabs = bt;
-                auto* pg = new Fl_Group(MAIN_X, TITLE_H + 51 + ed_h + 26, W - MAIN_X, BOTTOM_H - 27, "Проблемы");
-                auto* pl = new Fl_Browser(MAIN_X + 8, TITLE_H + 51 + ed_h + 32, W - MAIN_X - 16, BOTTOM_H - 40);
+                const int inner_h = BOTTOM_H - 26 - 27;
+                auto* pg = new Fl_Group(MAIN_X, tabs_y + 25, W - MAIN_X, inner_h, "Проблемы");
+                auto* pl = new Fl_Browser(MAIN_X + 8, tabs_y + 31, W - MAIN_X - 16, inner_h - 8);
                 pl->textsize(12);
                 pl->callback(prob_list_cb);
                 pl->when(FL_WHEN_CHANGED);
                 g.prob_list = pl;
                 pg->end();
-                auto* og = new Fl_Group(MAIN_X, TITLE_H + 51 + ed_h + 26, W - MAIN_X, BOTTOM_H - 27, "Вывод");
+                auto* og = new Fl_Group(MAIN_X, tabs_y + 25, W - MAIN_X, inner_h, "Вывод");
                 auto* ob = new Fl_Text_Buffer();
-                auto* od = new Fl_Text_Display(MAIN_X + 8, TITLE_H + 51 + ed_h + 32, W - MAIN_X - 16, BOTTOM_H - 40);
+                auto* od = new Fl_Text_Display(MAIN_X + 8, tabs_y + 31, W - MAIN_X - 16, inner_h - 8);
                 od->buffer(ob);
                 od->textfont(FL_COURIER);
                 od->textsize(12);
@@ -1297,26 +1533,34 @@ int main(int argc, char** argv) {
                 g.out_disp = od;
                 g.out_buf = ob;
                 og->end();
-                auto* ig = new Fl_Group(MAIN_X, TITLE_H + 51 + ed_h + 26, W - MAIN_X, BOTTOM_H - 27, "Ввод (stdin)");
-                auto* ib = new Fl_Text_Buffer();
-                auto* ie = new Fl_Text_Editor(MAIN_X + 8, TITLE_H + 51 + ed_h + 32, W - MAIN_X - 16, BOTTOM_H - 40);
-                ie->buffer(ib);
-                ie->textfont(FL_COURIER);
-                ie->textsize(12);
-                ie->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS, 0);
-                ib->text("");
-                ie->tooltip("Данные для программы (stdin) — передаются python при запуске");
-                g.stdin_ed = ie;
-                g.stdin_buf = ib;
-                ig->end();
                 bt->end();
+
+                auto* prow = new Fl_Group(MAIN_X, tabs_y + BOTTOM_H - 26, W - MAIN_X, 25);
+                prow->box(FL_FLAT_BOX);
+                g.proc_row = prow;
+                auto* pi = new Fl_Input(MAIN_X + 8, tabs_y + BOTTOM_H - 22,
+                                        W - MAIN_X - 116, 21, "ввод программе:");
+                pi->box(FL_THIN_DOWN_BOX);
+                pi->textfont(FL_COURIER);
+                pi->textsize(12);
+                pi->when(FL_WHEN_ENTER_KEY);
+                pi->tooltip("Enter отправляет строку программе в панели «Вывод»");
+                pi->deactivate();
+                g.proc_input = pi;
+                auto* stop = new Fl_Button(W - 102, tabs_y + BOTTOM_H - 23, 94, 22, "■ Стоп");
+                stop->box(FL_THIN_UP_BOX);
+                stop->labelcolor(theme::red());
+                stop->tooltip("Завершить программу");
+                stop->deactivate();
+                stop->callback([](Fl_Widget*, void*) { g.live.kill(); });
+                g.btn_stop = stop;
+                prow->end();
             }
             area->end();
         }
         main->end();
     }
 
-    // ---- status bar ----
     {
         auto* st = new Fl_Group(0, H - STATUS_H, W, STATUS_H);
         st->box(FL_FLAT_BOX);
@@ -1327,7 +1571,7 @@ int main(int argc, char** argv) {
         se->callback(status_err_cb);
         se->tooltip("Показать проблемы");
         g.status_err = se;
-        auto* sr = new Fl_Box(W - 360, H - STATUS_H + 2, 352, 20, "Стр 1, стлб 1   UTF-8");
+        auto* sr = new Fl_Box(W - 380, H - STATUS_H + 2, 372, 20, "Стр 1, стлб 1   UTF-8");
         sr->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
         sr->labelsize(11);
         sr->labelcolor(theme::fg_dim());
@@ -1335,12 +1579,8 @@ int main(int argc, char** argv) {
         st->end();
     }
 
-    // ---- theme menu (kept as title-bar extra) ----
-    // (activity → Настройки covers themes; the menu button is gone)
-
     win->end();
 
-    // initial theme + session restore
     apply_theme_ui(ThemeMode::System);
     g.rb_dark->clear();
     g.rb_light->clear();
@@ -1354,7 +1594,7 @@ int main(int argc, char** argv) {
             bool ok = false;
             for (const auto& f : p.files) if (f == target) { ok = true; break; }
             if (!ok) target = p.files.front();
-            extern_open(target.string());
+            open_file(target.string());
         }
         rebuild_browser();
     }
@@ -1368,9 +1608,5 @@ int main(int argc, char** argv) {
     Fl::add_timeout(0.15, cursor_timer_cb, nullptr);
 
     win->show(argc, argv);
-    int rc = Fl::run();
-#ifdef _WIN32
-    WSACleanup();
-#endif
-    return rc;
+    return Fl::run();
 }

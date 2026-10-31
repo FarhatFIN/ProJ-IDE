@@ -24,7 +24,11 @@ struct BuildResult {
     fs::path produced;      // binary path on success (not set for python)
 };
 
-BuildResult build_file(const fs::path& src, const std::string& stdin_data = {});
+BuildResult build_file(const fs::path& src, const std::string& stdin_data = {}, bool debug = false);
+
+// Syntax-only check for the real-time detector: -fsyntax-only / ast.parse.
+// Content is written to a temp file next to src so relative #include works.
+std::vector<BuildError> lint_file(const fs::path& src, const std::string& content);
 
 // Parses gcc/nasm-style "file:line[:col]: severity: msg" and python tracebacks.
 std::vector<BuildError> parse_compiler_log(const std::string& log);

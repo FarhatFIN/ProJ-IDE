@@ -81,6 +81,7 @@ std::string pkg_debian(const std::string& tool) {
     if (tool == "gcc") return "gcc";
     if (tool == "python3") return "python3";
     if (tool == "nasm") return "nasm";
+    if (tool == "gdb") return "gdb";
     return {};
 }
 
@@ -89,6 +90,7 @@ std::string pkg_fedora(const std::string& tool) {
     if (tool == "gcc") return "gcc";
     if (tool == "python3") return "python3";
     if (tool == "nasm") return "nasm";
+    if (tool == "gdb") return "gdb";
     return {};
 }
 
