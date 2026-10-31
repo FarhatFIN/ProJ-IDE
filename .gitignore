@@ -1,0 +1,11 @@
+build/
+dist/
+*.tar.gz
+*.o
+ProJ-IDE.exe
+projide
+projide-app
+projide-fltk
+srv.log
+*.log
+__pycache__/
